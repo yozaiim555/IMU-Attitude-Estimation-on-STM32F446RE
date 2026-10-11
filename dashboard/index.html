@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STM32 IMU attitude dashboard</title>
+<style>
+:root{--bg:#0e1116;--panel:#171b22;--ink:#e6e8eb;--mute:#8b93a1;--line:#2a303a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+button{background:transparent;color:var(--ink);border:1px solid #3a4250;border-radius:6px;padding:6px 12px;font:inherit;cursor:pointer}
+button:hover{background:#222833}
+button.on{background:#2a78d6;border-color:#2a78d6}
+#status{color:var(--mute);margin-left:auto}
+#view{flex:1;position:relative;min-height:0}
+#view>canvas{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+.panel{position:absolute;top:12px;background:rgba(23,27,34,.82);border:1px solid var(--line);border-radius:8px;padding:10px 14px}
+#hud{left:14px;min-width:210px}
+#hud h3{margin:0 0 6px;font-size:12px;font-weight:500;color:var(--mute);text-transform:uppercase;letter-spacing:.06em}
+#hud div{display:flex;justify-content:space-between;font-variant-numeric:tabular-nums}
+#hud label{display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+#instr{right:14px;display:flex;flex-direction:column;gap:8px;padding:10px}
+#ai{width:200px;height:200px}
+#hdg{width:200px;height:38px;border-radius:4px}
+#plots{display:flex;gap:8px;padding:8px 14px;background:var(--panel);border-top:1px solid var(--line);height:170px}
+#plots canvas{cursor:crosshair;flex:1;min-width:0;height:100%;border:1px solid var(--line);border-radius:6px}
+</style>
+</head>
+<body>
+<header>
+  <button id="connect">Connect board</button>
+  <button id="tare">Tare (level + zero heading)</button>
+  <button id="reset">Reset filters</button>
+  <button id="freeze">Freeze plots</button>
+  <span id="status">Not connected. Use Chrome or Edge. Drag to orbit, wheel to zoom, double-click to reset the view. Space = freeze plots.</span>
+</header>
+<div id="view">
+  <div id="hud" class="panel">
+    <h3>EKF attitude (deg)</h3>
+    <div><span>Roll</span><span id="r">0.0</span></div>
+    <div><span>Pitch</span><span id="p">0.0</span></div>
+    <div><span>Yaw</span><span id="y">0.0</span></div>
+    <h3 style="margin-top:10px">Show planes and plots</h3>
+    <label><input type="checkbox" id="vE" checked><span class="sw" style="background:#2a78d6"></span>EKF</label>
+    <label><input type="checkbox" id="vC" checked><span class="sw" style="background:#eda100"></span>Complementary</label>
+    <label><input type="checkbox" id="vG" checked><span class="sw" style="background:#e34948"></span>Gyro only (drifts)</label>
+  </div>
+  <div id="instr" class="panel"><canvas id="ai"></canvas><canvas id="hdg"></canvas></div>
+</div>
+<div id="plots"><canvas id="pr"></canvas><canvas id="pp"></canvas><canvas id="py"></canvas></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const D2R = Math.PI / 180;
+const view = $('view');
+const renderer = new THREE.WebGLRenderer({antialias: true});
+renderer.setPixelRatio(window.devicePixelRatio || 1);
+view.insertBefore(renderer.domElement, view.firstChild);
+const scene = new THREE.Scene();
+// sky dome + ground: the horizon stays level in the scene, the plane moves against it
+const skyTop = new THREE.Color(0x2a5da8), skyHor = new THREE.Color(0xcfe3f5), ground = new THREE.Color(0x2f3d2c);
+scene.background = ground;
+scene.fog = new THREE.Fog(ground, 10, 30);
+const dome = new THREE.SphereGeometry(60, 40, 28), dp = dome.attributes.position, dcol = [];
+for (let i = 0; i < dp.count; i++) {
+  const t = dp.getY(i) / 60, c = new THREE.Color();
+  if (t >= 0) c.lerpColors(skyHor, skyTop, Math.pow(t, 0.55)); else c.copy(ground);
+  dcol.push(c.r, c.g, c.b);
+}
+dome.setAttribute('color', new THREE.Float32BufferAttribute(dcol, 3));
+scene.add(new THREE.Mesh(dome, new THREE.MeshBasicMaterial({vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false})));
+const floor = new THREE.Mesh(new THREE.CircleGeometry(45, 64), new THREE.MeshBasicMaterial({color: ground}));
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -1.52;
+scene.add(floor);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(3, 6, 4);
+scene.add(sun);
+const grid = new THREE.GridHelper(24, 48, 0x7f9778, 0x55674f);
+grid.position.y = -1.5;
+scene.add(grid);
+
+// ---- mouse-controlled camera (orbit around the plane) ----
+let az = 0.48, el = 0.3, dist = 7.3, drag = null;
+function placeCam() {
+  camera.position.set(dist * Math.cos(el) * Math.sin(az), dist * Math.sin(el), dist * Math.cos(el) * Math.cos(az));
+  camera.lookAt(0, 0, 0);
+}
+const dom = renderer.domElement;
+dom.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; dom.setPointerCapture(e.pointerId); dom.style.cursor = 'grabbing'; });
+dom.addEventListener('pointermove', e => {
+  if (!drag) return;
+  az -= (e.clientX - drag[0]) * 0.008;
+  el = Math.max(-1.4, Math.min(1.4, el + (e.clientY - drag[1]) * 0.008));
+  drag = [e.clientX, e.clientY];
+  placeCam();
+});
+dom.addEventListener('pointerup', () => { drag = null; dom.style.cursor = 'grab'; });
+dom.addEventListener('wheel', e => { e.preventDefault(); dist = Math.max(3, Math.min(18, dist * (1 + e.deltaY * 0.001))); placeCam(); }, {passive: false});
+dom.addEventListener('dblclick', () => { az = 0.48; el = 0.3; dist = 7.3; placeCam(); });
+placeCam();
+
+// ---- plane model (built in body axes: x nose, y right wing, z down) ----
+function ext(pts, depth) {
+  const s = new THREE.Shape();
+  pts.forEach((p, i) => i ? s.lineTo(p[0], p[1]) : s.moveTo(p[0], p[1]));
+  return new THREE.ExtrudeGeometry(s, {depth, bevelEnabled: false});
+}
+function makePlane(color, opacity, wire, detail) {
+  const g = new THREE.Group();
+  const m = new THREE.MeshStandardMaterial({color, transparent: opacity < 1, opacity, wireframe: wire, metalness: 0.2, roughness: 0.55});
+  const add = (geo, mat, x, y, z) => { const o = new THREE.Mesh(geo, mat || m); o.position.set(x || 0, y || 0, z || 0); g.add(o); };
+  const prof = [[0.02,-1.45],[0.06,-1.25],[0.13,-0.7],[0.2,-0.1],[0.21,0.45],[0.17,0.95],[0.09,1.4],[0,1.62]].map(p => new THREE.Vector2(p[0], p[1]));
+  const fus = new THREE.LatheGeometry(prof, 24);
+  fus.rotateZ(-Math.PI / 2);
+  add(fus);
+  add(ext([[0.45,0.1],[-0.15,1.7],[-0.5,1.7],[-0.35,0.1],[-0.35,-0.1],[-0.5,-1.7],[-0.15,-1.7],[0.45,-0.1]], 0.05), null, 0.1, 0, 0.1);
+  add(ext([[0.25,0.05],[-0.05,0.65],[-0.2,0.65],[-0.15,0.05],[-0.15,-0.05],[-0.2,-0.65],[-0.05,-0.65],[0.25,-0.05]], 0.04), null, -1.0, 0, 0.02);
+  const fin = ext([[0.3,0],[-0.1,0.55],[-0.3,0.55],[-0.25,0]], 0.04);
+  fin.rotateX(-Math.PI / 2);
+  add(fin, null, -1.1, -0.02, -0.08);
+  const canopy = new THREE.SphereGeometry(0.16, 16, 12);
+  canopy.scale(2.0, 0.85, 0.9);
+  const glass = detail ? new THREE.MeshStandardMaterial({color: 0x9fd3ff, transparent: true, opacity: 0.8, metalness: 0.6, roughness: 0.1}) : null;
+  add(canopy, glass, 0.55, 0, -0.17);
+  if (detail) {
+    const dot = c => new THREE.MeshBasicMaterial({color: c});
+    add(new THREE.SphereGeometry(0.05, 10, 8), dot(0xff3030), -0.32, -1.7, 0.12);   // left wingtip: red
+    add(new THREE.SphereGeometry(0.05, 10, 8), dot(0x30ff60), -0.32, 1.7, 0.12);    // right wingtip: green
+  }
+  return g;
+}
+const planes = {E: makePlane(0x2a78d6, 1, false, true), C: makePlane(0xeda100, 0.35, false, false), G: makePlane(0xe34948, 0.5, true, false)};
+for (const k in planes) scene.add(planes[k]);
+planes.C.scale.setScalar(1.04);
+planes.G.scale.setScalar(1.08);
+
+// ---- data ----
+const qC = new THREE.Quaternion(0.5, 0.5, -0.5, 0.5);   // NED world -> three.js axes
+const q = {G: new THREE.Quaternion(), C: new THREE.Quaternion(), E: new THREE.Quaternion()};
+const qRef = new THREE.Quaternion();
+const MAXH = 2000;
+const hist = {E: [], C: [], G: []};
+const vis = {E: $('vE'), C: $('vC'), G: $('vG')};
+const pcols = {E: '#2a78d6', C: '#eda100', G: '#e34948'};
+let lines = 0;
+
+function eul(e) {
+  return [Math.atan2(2 * (e.w * e.x + e.y * e.z), 1 - 2 * (e.x * e.x + e.y * e.y)) / D2R,
+          Math.asin(Math.max(-1, Math.min(1, 2 * (e.w * e.y - e.z * e.x)))) / D2R,
+          Math.atan2(2 * (e.w * e.z + e.x * e.y), 1 - 2 * (e.y * e.y + e.z * e.z)) / D2R];
+}
+function pushHist() {
+  const inv = qRef.clone().invert();
+  for (const k in hist) {
+    hist[k].push(eul(q[k].clone().multiply(inv)));
+    if (hist[k].length > MAXH) hist[k].shift();
+  }
+}
+function clearHist() { for (const k in hist) hist[k].length = 0; }
+
+let frozen = false, snap = null, cursor = null;
+function setFreeze(on) {
+  frozen = on;
+  snap = on ? {E: hist.E.slice(), C: hist.C.slice(), G: hist.G.slice()} : null;
+  $('freeze').textContent = on ? 'Resume plots' : 'Freeze plots';
+  $('freeze').classList.toggle('on', on);
+}
+$('freeze').onclick = () => setFreeze(!frozen);
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && e.target.tagName !== 'BUTTON' && e.target.tagName !== 'INPUT') { e.preventDefault(); setFreeze(!frozen); }
+});
+['pr', 'pp', 'py'].forEach(id => {
+  const cv = $(id);
+  cv.addEventListener('pointermove', e => { cursor = e.offsetX / cv.clientWidth; });
+  cv.addEventListener('pointerleave', () => { cursor = null; });
+});
+
+// ---- canvases ----
+const cvs = [$('ai'), $('hdg'), $('pr'), $('pp'), $('py')];
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  const d = window.devicePixelRatio || 1;
+  cvs.forEach(c => { c.width = c.clientWidth * d; c.height = c.clientHeight * d; c.getContext('2d').setTransform(d, 0, 0, d, 0, 0); });
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---- artificial horizon ----
+function drawAI(roll, pitch) {
+  const c = $('ai').getContext('2d'), S = $('ai').clientWidth, R = S / 2 - 3, k = R / 32;
+  c.clearRect(0, 0, S, S);
+  c.save(); c.translate(S / 2, S / 2);
+  c.beginPath(); c.arc(0, 0, R, 0, 7); c.clip();
+  c.rotate(-roll * D2R); c.translate(0, pitch * k);
+  c.fillStyle = '#3b82c4'; c.fillRect(-3 * R, -6 * R, 6 * R, 6 * R);
+  c.fillStyle = '#8a5a2b'; c.fillRect(-3 * R, 0, 6 * R, 6 * R);
+  c.strokeStyle = '#fff'; c.fillStyle = '#fff'; c.lineWidth = 2; c.font = '10px system-ui'; c.textAlign = 'center';
+  c.beginPath(); c.moveTo(-3 * R, 0); c.lineTo(3 * R, 0); c.stroke();
+  c.lineWidth = 1.5;
+  for (let p = -30; p <= 30; p += 10) {
+    if (!p) continue;
+    const y = -p * k, w = (p % 20 === 0 ? 0.32 : 0.18) * R;
+    c.beginPath(); c.moveTo(-w, y); c.lineTo(w, y); c.stroke();
+    if (p % 20 === 0) { c.fillText(String(Math.abs(p)), w + 12, y + 3); c.fillText(String(Math.abs(p)), -w - 12, y + 3); }
+  }
+  c.restore();
+  c.save(); c.translate(S / 2, S / 2);
+  c.strokeStyle = '#fff'; c.fillStyle = '#fff'; c.lineWidth = 2;
+  [-60, -45, -30, -20, -10, 0, 10, 20, 30, 45, 60].forEach(a => {
+    c.save(); c.rotate(a * D2R); c.beginPath(); c.moveTo(0, -R); c.lineTo(0, -R + (a % 30 === 0 ? 11 : 6)); c.stroke(); c.restore();
+  });
+  c.save(); c.rotate(-roll * D2R);
+  c.beginPath(); c.moveTo(0, -R + 12); c.lineTo(-6, -R + 24); c.lineTo(6, -R + 24); c.closePath(); c.fill();
+  c.restore();
+  c.strokeStyle = '#ffd23f'; c.fillStyle = '#ffd23f'; c.lineWidth = 3;
+  c.beginPath(); c.moveTo(-0.55 * R, 0); c.lineTo(-0.18 * R, 0); c.lineTo(-0.18 * R, 0.08 * R);
+  c.moveTo(0.55 * R, 0); c.lineTo(0.18 * R, 0); c.lineTo(0.18 * R, 0.08 * R); c.stroke();
+  c.beginPath(); c.arc(0, 0, 3, 0, 7); c.fill();
+  c.strokeStyle = '#3a4250'; c.lineWidth = 2; c.beginPath(); c.arc(0, 0, R, 0, 7); c.stroke();
+  c.restore();
+}
+
+// ---- heading tape ----
+function drawHdg(h) {
+  const c = $('hdg').getContext('2d'), W = $('hdg').clientWidth, H = $('hdg').clientHeight, ppd = W / 80;
+  c.clearRect(0, 0, W, H);
+  c.fillStyle = '#0b0e13'; c.fillRect(0, 0, W, H);
+  c.strokeStyle = '#cfd5de'; c.fillStyle = '#cfd5de'; c.font = '10px system-ui'; c.textAlign = 'center'; c.lineWidth = 1;
+  for (let d = Math.floor(h - 41); d <= Math.ceil(h + 41); d++) {
+    if (d % 5) continue;
+    const x = W / 2 + (d - h) * ppd, dd = ((d % 360) + 360) % 360, major = dd % 10 === 0;
+    c.beginPath(); c.moveTo(x, H); c.lineTo(x, H - (major ? 9 : 5)); c.stroke();
+    if (dd % 30 === 0) c.fillText({0: 'N', 90: 'E', 180: 'S', 270: 'W'}[dd] || String(dd), x, H - 12);
+  }
+  c.strokeStyle = '#ffd23f'; c.fillStyle = '#ffd23f'; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(W / 2, 0); c.lineTo(W / 2, H); c.stroke();
+  c.font = '11px system-ui'; c.textAlign = 'left';
+  c.fillText(String(Math.round(h) % 360).padStart(3, '0') + '\u00b0', W / 2 + 5, 11);
+}
+
+// ---- live plots ----
+function drawPlot(cv, idx, name) {
+  const c = cv.getContext('2d'), W = cv.clientWidth, H = cv.clientHeight;
+  const src = frozen && snap ? snap : hist;
+  c.clearRect(0, 0, W, H);
+  const keys = ['G', 'C', 'E'].filter(k => vis[k].checked);
+  let lo = Infinity, hi = -Infinity;
+  keys.forEach(k => src[k].forEach(e => { lo = Math.min(lo, e[idx]); hi = Math.max(hi, e[idx]); }));
+  if (idx === 2) { lo = -180; hi = 180; }
+  else if (!isFinite(lo)) { lo = -10; hi = 10; }
+  else { if (hi - lo < 10) { const m = (hi + lo) / 2; lo = m - 5; hi = m + 5; } const pad = (hi - lo) * 0.1; lo -= pad; hi += pad; }
+  const Y = v => H - 6 - (v - lo) / (hi - lo) * (H - 12);
+  c.strokeStyle = '#2a303a'; c.lineWidth = 1;
+  if (lo < 0 && hi > 0) { c.beginPath(); c.moveTo(0, Y(0)); c.lineTo(W, Y(0)); c.stroke(); }
+  c.fillStyle = '#8b93a1'; c.font = '11px system-ui'; c.textAlign = 'left';
+  c.fillText(name + ' (deg)' + (frozen ? '  FROZEN' : ''), 8, 14); c.fillText(hi.toFixed(0), W - 30, 12); c.fillText(lo.toFixed(0), W - 30, H - 4);
+  keys.forEach(k => {
+    const a = src[k];
+    c.strokeStyle = pcols[k]; c.lineWidth = k === 'E' ? 2 : 1.4; c.beginPath();
+    let prev = null;
+    a.forEach((e, i) => {
+      const x = W - (a.length - 1 - i) * W / MAXH, y = Y(e[idx]);
+      if (prev === null || Math.abs(e[idx] - prev) > 180) c.moveTo(x, y); else c.lineTo(x, y);
+      prev = e[idx];
+    });
+    c.stroke();
+  });
+  if (frozen && cursor !== null) {
+    const x = cursor * W;
+    c.strokeStyle = '#8b93a1'; c.lineWidth = 1; c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke();
+    c.fillStyle = '#8b93a1'; c.textAlign = 'left';
+    c.fillText('-' + ((W - x) / W * MAXH * 0.01).toFixed(1) + ' s', Math.min(x + 6, W - 80), H - 4);
+    keys.forEach((k, j) => {
+      const a = src[k], i = a.length - 1 - Math.round((W - x) * MAXH / W);
+      if (i < 0 || i >= a.length) return;
+      c.fillStyle = pcols[k]; c.beginPath(); c.arc(x, Y(a[i][idx]), 3.5, 0, 7); c.fill();
+      c.fillText((k === 'E' ? 'EKF ' : k === 'C' ? 'Comp ' : 'Gyro ') + a[i][idx].toFixed(2), 8, 30 + 13 * j);
+    });
+  }
+}
+
+function frame() {
+  const inv = qRef.clone().invert();
+  for (const k in planes) planes[k].quaternion.copy(qC).multiply(q[k].clone().multiply(inv));
+  for (const k in planes) planes[k].visible = vis[k].checked;
+  const [roll, pitch, yaw] = eul(q.E.clone().multiply(inv));
+  $('r').textContent = roll.toFixed(1);
+  $('p').textContent = pitch.toFixed(1);
+  $('y').textContent = yaw.toFixed(1);
+  drawAI(roll, pitch);
+  drawHdg(((yaw % 360) + 360) % 360);
+  drawPlot($('pr'), 0, 'Roll'); drawPlot($('pp'), 1, 'Pitch'); drawPlot($('py'), 2, 'Yaw');
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+frame();
+
+// ---- serial ----
+function handle(line) {
+  if (line.indexOf('Q,') !== 0) return;
+  const f = line.split(',').slice(2).map(Number);
+  if (f.length < 12 || f.slice(0, 12).some(isNaN)) return;
+  q.G.set(f[1], f[2], f[3], f[0]);
+  q.C.set(f[5], f[6], f[7], f[4]);
+  q.E.set(f[9], f[10], f[11], f[8]);
+  pushHist();
+  lines++;
+}
+let port = null, writer = null;
+const status = $('status');
+$('connect').onclick = async () => {
+  if (!('serial' in navigator)) { status.textContent = 'Web Serial is not available. Use Chrome or Edge.'; return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({baudRate: 460800});
+    status.textContent = 'Connected, waiting for data...';
+    const dec = new TextDecoderStream();
+    port.readable.pipeTo(dec.writable);
+    const reader = dec.readable.getReader();
+    const enc = new TextEncoderStream();
+    enc.readable.pipeTo(port.writable);
+    writer = enc.writable.getWriter();
+    let buf = '';
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += value;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { handle(buf.slice(0, i).trim()); buf = buf.slice(i + 1); }
+    }
+  } catch (err) {
+    status.textContent = 'Connection failed: ' + err.message;
+  }
+};
+$('tare').onclick = () => { qRef.copy(q.E); clearHist(); setFreeze(false); };
+$('reset').onclick = () => { if (writer) writer.write('r'); qRef.set(0, 0, 0, 1); clearHist(); setFreeze(false); };
+setInterval(() => { if (port) status.textContent = 'Connected, ' + lines + ' samples/s. Drag to orbit, wheel to zoom, double-click to reset the view. Space = freeze plots.'; lines = 0; }, 1000);
+</script>
+</body>
+</html>
