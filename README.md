@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/e7aca600-2801-4c82-811f-36891c2ff6a2
+
 # STM32 IMU Attitude EKF
 
 Real-time 3D attitude estimation with an **STM32 Nucleo F446RE** and an **MPU6050 (GY-521)**,
